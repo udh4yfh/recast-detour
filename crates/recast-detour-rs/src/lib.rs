@@ -29,6 +29,7 @@ pub enum Error {
     CreateQueryError(String),
     FindPointError(String),
     FindPathError(String),
+    InvalidRefError(String),
     PartialResult,
 }
 
@@ -85,7 +86,6 @@ impl Point {
     pub fn new((x, y, z): (f32, f32, f32)) -> Point {
         Point([x, y, z])
     }
-
     pub fn x(&self) -> f32 {
         self.0[0]
     }
@@ -144,19 +144,13 @@ impl RecastQuery {
 
         let mut cu_verts = Vec::new();
 
-        // World Unit to Cell Unit
-        for i in (0..data.vertices.len()).step_by(3) {
-            for j in 0..3 {
-                cu_verts.push(world_unit_to_cell_unit(
-                    data.vertices[i + j],
-                    bmin[j],
-                    data.cell_size,
-                ));
-            }
+        for i in 0..data.vertices.len() {
+            let axis = i % 3;
+            cu_verts.push(world_unit_to_cell_unit(data.vertices[i], bmin[axis], data.cell_size));
         }
         assert!(data.vertices.len() == cu_verts.len());
 
-        let (cu_verts, indices) = remove_dup(&cu_verts, &data.indices);
+        let indices = &data.indices;
 
         let vert_count = cu_verts.len() / 3;
         let triangles_count = data.indices.len() / 3;
@@ -171,7 +165,7 @@ impl RecastQuery {
             polys.push(0);
         }
 
-        util::build_mesh_adjacency(&mut polys, vert_count, 3);
+        util::build_mesh_adjacency(&mut polys, triangles_count, vert_count, 3);
 
         let poly_flags = vec![POLYFLAGS_WALK; triangles_count];
 
@@ -182,11 +176,11 @@ impl RecastQuery {
         let mut params = dtNavMeshCreateParams {
             verts: cu_verts.as_ptr(),
             vertCount: vert_count as i32,
-            polys: polys.as_ptr(),
+            polys: polys.as_ptr(), // *const ::std::os::raw::c_ushort, The polygon data. [Size: #polyCount * 2 * #nvp]"]
             polyFlags: poly_flags.as_ptr(),
             polyAreas: poly_areas.as_ptr(),
             polyCount: triangles_count as i32,
-            nvp: 3,
+            nvp: 3, // Number maximum number of vertices per polygon. [Limit: >= 3]"]
             detailMeshes: std::ptr::null(),
             detailVerts: std::ptr::null(),
             detailVertsCount: 0,
@@ -296,12 +290,13 @@ impl RecastQuery {
         Ok(RecastQuery { mesh, q })
     }
 
-    pub fn find_path(&self, start: Point, end: Point, r: f32) -> Result<Vec<Point>> {
+    /// Find an ordered list of polygon references representing the path. (Start to end.)
+    pub fn find_path(&self, start: Point, end: Point, max_length: usize, r: f32) -> Result<Vec<dtPolyRef>> {
         let (start_p, start_poly) = self.find_poly(start, r)?;
         let (end_p, end_poly) = self.find_poly(end, r)?;
 
         if start_poly == end_poly {
-            return Ok(vec![end_p]);
+            return Ok(vec![end_poly]);
         }
 
         let filter = dtQueryFilter {
@@ -310,23 +305,23 @@ impl RecastQuery {
             m_excludeFlags: 0,
         };
 
-        let mut path = vec![0; 100];
+        let mut path: Vec<dtPolyRef> = vec![0; max_length];
         let mut count = 0;
 
+        println!("start,end {start_poly}:{end_poly}");
         let status = unsafe {
             (*self.q.as_ptr()).findPath(
                 start_poly,
                 end_poly,
-                start_p.0.as_ptr(),
-                end_p.0.as_ptr(),
+                (start_p).0.as_ptr(),
+                (end_p).0.as_ptr(),
                 &filter,
                 path.as_mut_ptr(),
                 &mut count,
-                100,
+                max_length as std::os::raw::c_int,
             )
         };
-        path.truncate(count as usize);
-
+        
         if status & DT_FAILURE != 0 {
             Err(Error::FindPathError("FAIL_TO_FIND_PATH".to_owned()))
         } else if status & DT_INVALID_PARAM != 0 {
@@ -340,21 +335,86 @@ impl RecastQuery {
         } else if path.len() == 0 {
             Err(Error::FindPathError("NoPath".to_owned()))
         } else {
-            if path.len() == 1 {
-                // Same Poly, so just return the next point
-                Ok(vec![end_p])
-            } else {
-                // remap the poly and the points
-                let mut res = vec![];
-                let mut p = start_p;
-                for &poly in path.iter() {
-                    p = self.find_closest(p, poly)?;
-                    res.push(p);
-                }
-
-                Ok(res)
-            }
+            path.truncate(count as usize);
+            Ok(path)
         }
+    }
+
+    pub fn find_straight_path(&self, start: Point, end: Point, path: &Vec<dtPolyRef>) -> Result<Vec<Point>> {
+        let path_size = path.len();
+        let max_straight_path = path_size*3;
+
+        let mut straight_path: Vec<Point> = vec![Point::new((0.0, 0.0, 0.0)); max_straight_path];
+        let mut straight_path_flags = vec![0; max_straight_path];
+        let mut straight_path_refs = vec![0; max_straight_path];
+        let mut straight_path_count = 0;
+
+        let opt = dtStraightPathOptions_DT_STRAIGHTPATH_AREA_CROSSINGS;
+        //let opt = dtStraightPathOptions_DT_STRAIGHTPATH_ALL_CROSSINGS;
+
+        let status = unsafe { (*self.q.as_ptr()).findStraightPath(
+            start.0.as_ptr(),
+            end.0.as_ptr(),
+            path.as_ptr(),
+            path_size as std::os::raw::c_int,
+            straight_path[0].0.as_mut_ptr(),
+            straight_path_flags.as_mut_ptr(),
+            straight_path_refs.as_mut_ptr(),
+            &mut straight_path_count as *mut std::os::raw::c_int,
+            max_straight_path as std::os::raw::c_int,
+            opt,
+        )};
+
+        if status & DT_FAILURE != 0  {
+            Err(Error::FindPathError("unable to find straight path".into()))
+        } else {
+            debug_assert!( (status & DT_SUCCESS) != 0);
+
+            straight_path.truncate(straight_path_count as usize);
+            Ok(straight_path)
+        }
+    }
+
+    pub fn get_tile_and_poly_from_ref(&self, poly_ref: dtPolyRef) -> Result<(*const dtMeshTile, *const dtPoly)>  {
+        let mut tile = 0 as *const dtMeshTile;
+        let mut poly = 0 as *const dtPoly;
+        let status = unsafe { dtNavMesh_getTileAndPolyByRef(self.mesh.as_ptr(), poly_ref, &mut tile, &mut poly) };
+        if status & DT_SUCCESS == 0 { 
+            Ok((tile, poly)) 
+        } else {
+            Err(Error::InvalidRefError("poly_ref was invalid".to_owned()))
+        }
+    }
+
+    unsafe fn get_tile_vertex(tile: *const dtMeshTile, idx: std::os::raw::c_ushort) -> Point {
+        let x = *((*tile).verts.add((idx as usize) * 3 + 0));
+        let y = *((*tile).verts.add((idx as usize) * 3 + 1));
+        let z = *((*tile).verts.add((idx as usize) * 3 + 2));
+        Point::new((x,y,z))
+    }
+
+    pub fn get_poly_centroid(&self, poly_ref: dtPolyRef) -> Result<Point> {
+        let (tile, poly) = self.get_tile_and_poly_from_ref(poly_ref)?;
+
+        // we know that poly and tile are valid at this point
+        // pub verts: [::std::os::raw::c_ushort; 6usize]   ----  apparantly, maximum 6 verts per poly
+        let poly_verts = unsafe { &(*poly).verts }; 
+        let num_inds = unsafe { (*poly).vertCount } as usize;
+        
+        let mut res = Point::new((0.0, 0.0, 0.0));
+
+        for idx in &poly_verts[0..num_inds] {
+            let Point([x,y,z]) = unsafe { Self::get_tile_vertex(tile, *idx) };
+            res.0[0] += x;
+            res.0[1] += y;
+            res.0[2] += z;
+        }
+
+        for i in 0..num_inds {
+            res.0[i] = res.0[i] / num_inds as f32;
+        }
+
+        Ok(res)
     }
 
     fn find_closest(&self, pos: Point, target_poly: u32) -> Result<Point> {
@@ -390,15 +450,18 @@ impl RecastQuery {
         };
         let mut result_poly = 0;
         let mut result_pos = [0.0; 3];
+        let mut is_over_poly = false;
+
         // SAFETY: Dereferencing is safe for Rust since Self only stores pointers.
         // `findNearestPoly` only mutates `result_poly` and `result_pos`.
         let status = unsafe {
-            (*self.q.as_ptr()).findNearestPoly(
+            (*self.q.as_ptr()).findNearestPoly1(
                 pos.0.as_ptr(),
                 [r, r, r].as_ptr(),
                 &filter,
                 &mut result_poly,
                 result_pos.as_mut_ptr(),
+                &mut is_over_poly,
             )
         };
 
@@ -418,7 +481,7 @@ impl RecastQuery {
             return Err(Error::FindPointError("PARTIAL_RESULT".to_owned()));
         }
 
-        if result_poly == 0 {
+        if result_poly == 0 || !is_over_poly {
             Err(Error::FindPointError("No poly found".to_owned()))
         } else {
             Ok((Point(result_pos), result_poly))
