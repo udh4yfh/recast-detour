@@ -108,7 +108,7 @@ pub fn build_mesh_adjacency(polys: &mut [u16], npolys: usize, nverts: usize, ver
 			let v0 = t[j];
 			let v1 = if j+1 >= verts_per_poly || t[j+1] == RC_MESH_NULL_IDX { t[0] } else { t[j+1] };
 			if v0 < v1 {
-				let mut edge = &mut edges[edge_count];
+				let edge = &mut edges[edge_count];
 				edge.vert[0] = v0;
 				edge.vert[1] = v1;
 				edge.poly[0] = i as u16;
@@ -132,7 +132,7 @@ pub fn build_mesh_adjacency(polys: &mut [u16], npolys: usize, nverts: usize, ver
 			if v0 > v1 {
                 let mut e = first_edge[v1 as usize];
                 while e != RC_MESH_NULL_IDX {
-                    let mut edge = &mut edges[e as usize];
+                    let edge = &mut edges[e as usize];
 					if edge.vert[1] == v0 && edge.poly[0] == edge.poly[1] {
 						edge.poly[1] = i as u16;
 						edge.poly_edge[1] = j as u16;

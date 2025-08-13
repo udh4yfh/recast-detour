@@ -135,10 +135,32 @@ pub fn remove_dup(verts: &[u16], indices: &[u16]) -> (Vec<u16>, Vec<u16>) {
 }
 
 impl RecastQuery {
+    fn add_dummy_data(mut data: NavMeshData) -> NavMeshData {
+        let old_length = (data.vertices.len()/3usize) as u16;
+
+        // Add some very far away triangle verts
+        for i in 0..3 {
+            for j in 0..3 {
+                data.vertices.push(data.cell_size* ((65500 + i + j) as f32));
+            }
+        }
+
+        data.indices.push(data.indices[0]);
+        data.indices.push(data.indices[1]);
+        data.indices.push(data.indices[2]);
+        data.indices[0] = old_length;
+        data.indices[1] = old_length + 1;
+        data.indices[2] = old_length + 2;
+
+        data
+    }
+
     /// Create a query from NavMesh
     pub fn new_from_mesh(data: NavMeshData) -> Result<RecastQuery> {
-        assert!(data.vertices.len() % 3 == 0);
-        assert!(data.indices.len() % 3 == 0);
+        let data = Self::add_dummy_data(data);
+
+        debug_assert!(data.vertices.len() % 3 == 0);
+        debug_assert!(data.indices.len() % 3 == 0);
 
         let (bmin, bmax) = compute_bb(&data.vertices);
 
@@ -148,7 +170,7 @@ impl RecastQuery {
             let axis = i % 3;
             cu_verts.push(world_unit_to_cell_unit(data.vertices[i], bmin[axis], data.cell_size));
         }
-        assert!(data.vertices.len() == cu_verts.len());
+        debug_assert!(data.vertices.len() == cu_verts.len());
 
         let indices = &data.indices;
 
@@ -344,7 +366,7 @@ impl RecastQuery {
         let path_size = path.len();
         let max_straight_path = path_size*3;
 
-        let mut straight_path: Vec<Point> = vec![Point::new((0.0, 0.0, 0.0)); max_straight_path];
+        let mut straight_path: Vec<Point> = vec![Point::new((0.0, 0.0, 0.0)); path_size];
         let mut straight_path_flags = vec![0; max_straight_path];
         let mut straight_path_refs = vec![0; max_straight_path];
         let mut straight_path_count = 0;
@@ -375,11 +397,46 @@ impl RecastQuery {
         }
     }
 
+    /// Find a path by finding the shared edges between consecutive polygons on the corridor and taking the midpoint.
+    pub fn find_short_path(&self, start: Point, end: Point, path: &Vec<dtPolyRef>) -> Result<Vec<Point>> {
+        let mut points = vec![start];
+
+        for i in 0..path.len()-1 {
+            let cur_poly: dtPolyRef = path[i];
+            let next_poly: dtPolyRef = path[i+1];
+
+            let (tile, p1) = self.get_tile_and_poly_from_ref(cur_poly)?;
+        
+            // find the shared edge
+            let neighbs = unsafe { (*p1).neis };
+
+            for (edge_idx, nei) in neighbs[0..3].iter().enumerate() {
+                println!("{} {}", next_poly, nei);
+                // TODO how to calculate this constant 2^x - 1
+                if next_poly == (nei + 255) as dtPolyRef || next_poly == (nei + 63) as dtPolyRef {
+                    unsafe {
+                        // The shared edge's vertices
+                        let i1 = (*p1).verts[edge_idx];
+                        let i2 = (*p1).verts[(edge_idx+1)%3];
+                        let v1 = Self::get_tile_vertex(tile, i1);
+                        let v2 = Self::get_tile_vertex(tile, i2);
+                        
+                        let midpoint = ((v1.x() + v2.x())*0.5, (v1.y() + v2.y())*0.5, (v1.z() + v2.z())*0.5);
+                        points.push(midpoint.into());
+                    }
+                }
+            }
+        }
+
+        points.push(end);
+        Ok(points)
+    }
+
     pub fn get_tile_and_poly_from_ref(&self, poly_ref: dtPolyRef) -> Result<(*const dtMeshTile, *const dtPoly)>  {
         let mut tile = 0 as *const dtMeshTile;
         let mut poly = 0 as *const dtPoly;
         let status = unsafe { dtNavMesh_getTileAndPolyByRef(self.mesh.as_ptr(), poly_ref, &mut tile, &mut poly) };
-        if status & DT_SUCCESS == 0 { 
+        if status & DT_SUCCESS != 0 { 
             Ok((tile, poly)) 
         } else {
             Err(Error::InvalidRefError("poly_ref was invalid".to_owned()))
